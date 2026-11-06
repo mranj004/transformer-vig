@@ -1,6 +1,6 @@
 """Create a reproducible rapeseed-only grouped 60/20/20 split for data.py.
 
-Uses only the Python standard library. Run --help or see prepare_split_README.md.
+Uses only the Python standard library. Run --help or see README.md.
 First create a grouping template, fill in verified physical_field_id values, then
 create the split. Alternatively --by-farm groups every record from a farm together
 for an explicitly coarser, unseen-farm experiment.
@@ -19,9 +19,10 @@ import random
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from paths import DEFAULT_DATA_ROOT
+
 
 SPLITS = ("train", "val", "test")
-DEFAULT_ROOT = r"C:\Users\Owner\OneDrive\Desktop\UCR\backup-chenlab\other_germany\Germany_raw"
 
 
 def discover_rapeseed(root: Path) -> tuple[list[dict], list[str]]:
@@ -212,7 +213,7 @@ def grouped_random_split(records: list[dict], ratios=(0.6, 0.2, 0.2),
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path(DEFAULT_ROOT))
+    parser.add_argument("--root", type=Path, default=DEFAULT_DATA_ROOT)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--make-group-template", type=Path, metavar="CSV",
                       help="List rapeseed records with blank physical_field_id values; no split is made")

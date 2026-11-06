@@ -16,9 +16,11 @@ from rasterio.enums import Resampling
 from rasterio.warp import reproject
 from torch.utils.data import DataLoader, Dataset
 
+from paths import DEFAULT_DATA_ROOT
+
 
 YIELD_MAP = "mean_scaled_yield_masked_regional_statistical_outlier.tif"
-DEFAULT_BAND = tuple(range, 13) #Rasterio uses ONE-based band indexes
+DEFAULT_BAND = tuple(range(1, 13))  # Rasterio uses ONE-based band indexes.
 
 def _date(value: str):
     return datetime.strptime(value, "%d.%m.%Y").date()
@@ -90,6 +92,124 @@ def _read_manifest(root: Path, manifest: Path) -> list[dict]:
     if not any(r["split"] == "train" for r in rows):
         raise ValueError("Manifest has no training records.")
     return rows
+
+
+class RapeseedDataset(Dataset):
+    """Read aligned spectral imagery and input-only observation masks by season."""
+
+    def __init__(self, root, manifest, split="train", bands=DEFAULT_BAND,
+                 max_dates=24, max_days_after_sowing=None, clear_scl=(4, 5),
+                 radiometric_scale=1.0, radiometric_offset=0.0, normalization=None):
+        self.root = Path(root).resolve()
+        self.split = split
+        self.bands = tuple(bands)
+        self.band_names = tuple(f"band_{band}" for band in self.bands)
+        if split not in {"train", "val", "test"}:
+            raise ValueError("Unknown dataset split")
+        if not self.bands or min(self.bands) < 1 or len(set(self.bands)) != len(self.bands):
+            raise ValueError("Bands must be distinct positive one-based indexes")
+        if max_dates < 0 or (max_days_after_sowing is not None and max_days_after_sowing < 0):
+            raise ValueError("Date limits must be nonnegative")
+        if not clear_scl or not all(math.isfinite(v) for v in (radiometric_scale, radiometric_offset)):
+            raise ValueError("Need clear SCL classes and finite radiometric parameters")
+        self.config = dict(bands=list(self.bands), max_dates=max_dates,
+                           max_days_after_sowing=max_days_after_sowing,
+                           clear_scl=list(clear_scl), radiometric_scale=radiometric_scale,
+                           radiometric_offset=radiometric_offset)
+        rows = _read_manifest(self.root, Path(manifest))
+        self.records = [row for row in rows if row["split"] == split]
+        if not self.records:
+            raise ValueError(f"Manifest has no {split} records")
+        train_records = [dict(folder=r["folder"], physical_field_id=r["physical_field_id"],
+                              field_mask=r.get("field_mask", ""), metadata=r["metadata"])
+                         for r in rows if r["split"] == "train"]
+        # Relative record identities allow the same dataset/checkpoint to move hosts.
+        signature = dict(records=sorted(train_records, key=lambda r: r["folder"]))
+        self.train_signature = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
+        if isinstance(normalization, (str, Path)):
+            normalization = json.loads(Path(normalization).read_text(encoding="utf-8"))
+        self.normalization = normalization
+        if normalization is not None:
+            if (normalization["config"] != self.config or
+                    normalization["train_signature"] != self.train_signature or
+                    normalization["band_names"] != list(self.band_names)):
+                raise ValueError("Normalization does not match training records or preprocessing")
+            mean = np.asarray(normalization["mean"], dtype=np.float32)
+            std = np.asarray(normalization["std"], dtype=np.float32)
+            if (mean.shape != (len(self.bands),) or std.shape != mean.shape or
+                    not np.isfinite(mean).all() or not np.isfinite(std).all() or (std <= 0).any()):
+                raise ValueError("Invalid normalization statistics")
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, index):
+        record = self.records[index]
+        folder, metadata = record["path"], record["metadata"]
+        sowing = _date(metadata["seeding_date"])
+        cutoff = _date(metadata["harvesting_date"])
+        limit = self.config["max_days_after_sowing"]
+        if limit is not None:
+            cutoff = min(cutoff, sowing + timedelta(days=limit))
+        candidates = []
+        for path in sorted((folder / "s2_images").glob("S2_L2A_*.tif")):
+            acquired = datetime.strptime(path.stem.removeprefix("S2_L2A_"), "%Y%m%d").date()
+            if sowing <= acquired <= cutoff:
+                candidates.append((path, acquired))
+        if not candidates:
+            raise ValueError(f"No in-season imagery for {folder.name}")
+        # Derive the prediction grid from imagery, never from the yield target.
+        grid = _grid(candidates[0][0])
+        field_mask = None
+        mask_path = (record.get("field_mask") or "").strip()
+        if mask_path:
+            mask = _read_aligned(self.root / mask_path, grid)
+            field_mask = np.isfinite(mask) & (mask > 0)
+        images, masks, dates = [], [], []
+        for path, acquired in candidates:
+            image = _read_aligned(path, grid, self.bands, Resampling.bilinear)
+            scl_path = folder / "scl_masks" / f"S2_L2A_SCL_{acquired:%Y%m%d}.tif"
+            scl = _read_aligned(scl_path, grid)
+            observed = np.isfinite(image).all(axis=0, keepdims=True) & np.isin(scl, self.config["clear_scl"])
+            if field_mask is not None:
+                observed &= field_mask
+            if not observed.any():
+                continue
+            image = image * self.config["radiometric_scale"] + self.config["radiometric_offset"]
+            if self.normalization is not None:
+                mean = np.asarray(self.normalization["mean"], dtype=np.float32)[:, None, None]
+                std = np.asarray(self.normalization["std"], dtype=np.float32)[:, None, None]
+                image = (image - mean) / std
+            images.append(np.where(observed, image, 0).astype(np.float32))
+            masks.append(observed)
+            dates.append(acquired)
+        if not images:
+            raise ValueError(f"No clear observations for {folder.name}")
+        count = self.config["max_dates"]
+        selected = (np.linspace(0, len(images) - 1, count, dtype=int)
+                    if count and len(images) > count else range(len(images)))
+        selected_dates = [dates[i] for i in selected]
+        target = _read_aligned(folder / "yield_masks" / YIELD_MAP, grid)
+        target_valid = np.isfinite(target)
+        if field_mask is not None:
+            target_valid &= field_mask
+        field_yield = float(metadata["yield_ground_truth"])
+        if not math.isfinite(field_yield):
+            raise ValueError(f"Invalid field yield for {folder.name}")
+        return dict(
+            images=torch.from_numpy(np.stack([images[i] for i in selected])),
+            observation_mask=torch.from_numpy(np.stack([masks[i] for i in selected])),
+            days_since_sowing=torch.tensor([(date - sowing).days for date in selected_dates], dtype=torch.float32),
+            field_yield=torch.tensor([field_yield], dtype=torch.float32),
+            pixel_yield=torch.from_numpy(np.where(target_valid, target, 0).astype(np.float32)),
+            pixel_valid_mask=torch.from_numpy(target_valid),
+            field_mask=torch.from_numpy(field_mask) if field_mask is not None else None,
+            sample_id=record["folder"], physical_field_id=record["physical_field_id"],
+            band_names=self.band_names, crs=grid["crs"], transform=grid["transform"],
+            acquisition_dates=[date.isoformat() for date in selected_dates],
+        )
+
+
 def collate_rapeseed(samples: list[dict], pad_multiple: int = 4) -> dict:
 
     """
@@ -175,7 +295,7 @@ def fit_band_stats(dataset: RapeseedDataset, output_path=None) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", required=True)
+    parser.add_argument("--root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--split", choices=["train", "val", "test"], default="train")
     parser.add_argument("--max-dates", type=int, default=24)

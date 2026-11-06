@@ -1,8 +1,8 @@
-"""Temporal Transformer -> ViG-style graph blocks -> field and pixel yield.
+"""Multispectral patches -> spatial ViT -> spatial graph -> GNN -> yield.
 
 Compatible with data.py's RapeseedDataset/collate_rapeseed. Requires PyTorch 2.x.
 This is a compact, independently implemented ViG-style adaptation, not the exact
-ImageNet ViG architecture or a pretrained checkpoint. See model_README.md.
+ImageNet ViG architecture or a pretrained checkpoint. See README.md.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ class ModelConfig:
     in_channels: int = 12
     embed_dim: int = 96
     patch_size: int = 4
+    vit_layers: int = 2
+    vit_heads: int = 4
     temporal_layers: int = 2
     temporal_heads: int = 4
     graph_layers: int = 2       # Set to 0 for a transformer-only ablation.
@@ -27,12 +29,12 @@ class ModelConfig:
     mlp_ratio: int = 2
     dropout: float = 0.1
     min_observed_fraction: float = 0.25
-    spatial_distance_weight: float = 0.1
     knn_chunk_size: int = 256
 
     def __post_init__(self):
         for name in ("in_channels", "embed_dim", "patch_size", "temporal_layers",
-                     "temporal_heads", "graph_k", "mlp_ratio", "knn_chunk_size"):
+                     "temporal_heads", "vit_layers", "vit_heads", "graph_k",
+                     "mlp_ratio", "knn_chunk_size"):
             value = getattr(self, name)
             if not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -40,28 +42,58 @@ class ModelConfig:
             raise ValueError("graph_layers must be a nonnegative integer")
         if self.embed_dim % self.temporal_heads:
             raise ValueError("embed_dim must be divisible by temporal_heads")
+        if self.embed_dim % self.vit_heads:
+            raise ValueError("embed_dim must be divisible by vit_heads")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0, 1)")
         if not 0 < self.min_observed_fraction <= 1:
             raise ValueError("min_observed_fraction must be in (0, 1]")
-        if not math.isfinite(self.spatial_distance_weight) or self.spatial_distance_weight < 0:
-            raise ValueError("spatial_distance_weight must be finite and nonnegative")
 
 
-class DynamicViGBlock(nn.Module):
-    """Dynamic feature kNN + max-relative graph convolution + residual FFN.
+class SpatialPatchGraph(nn.Module):
+    """Connect each valid patch to its k nearest patch centers in raster space.
 
-    Valid nodes are gathered separately for each sample, so padding/missing nodes
-    cannot enter the graph. LayerNorm operates on channels, not batch/spatial size.
-    Graph search is discrete; gradients flow through selected neighbor features.
+    Edges depend only on spatial distance, never spectral/learned similarity.
+    Each pair stores global valid-node IDs and neighbor indices local to them.
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
-        d = config.embed_dim
         self.k = config.graph_k
         self.chunk_size = config.knn_chunk_size
-        self.spatial_weight = config.spatial_distance_weight
+
+    @torch.no_grad()
+    def forward(self, valid: Tensor, coordinates: Tensor) -> list[tuple[Tensor, Tensor]]:
+        graphs = []
+        for sample_valid in valid:
+            ids = sample_valid.nonzero(as_tuple=False).flatten()
+            points = coordinates[ids].float()
+            n = ids.numel()
+            k = min(self.k, max(0, n - 1))
+            if k == 0:
+                neighbors = torch.empty((n, 0), dtype=torch.long, device=valid.device)
+            else:
+                chunks = []
+                with torch.autocast(device_type=valid.device.type, enabled=False):
+                    for start in range(0, n, self.chunk_size):
+                        stop = min(start + self.chunk_size, n)
+                        distances = torch.cdist(points[start:stop], points,
+                                                compute_mode="donot_use_mm_for_euclid_dist")
+                        local = torch.arange(stop - start, device=valid.device)
+                        distances[local, local + start] = float("inf")
+                        # Stable ordering breaks equal-distance ties by raster order.
+                        chunks.append(distances.argsort(dim=1, stable=True)[:, :k])
+                neighbors = torch.cat(chunks, dim=0)
+            graphs.append((ids, neighbors))
+        return graphs
+
+
+class SpatialGraphBlock(nn.Module):
+    """Max-relative neighbor aggregation, residual update and channel FFN."""
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        d = config.embed_dim
         self.project = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d))
         self.message = nn.Sequential(nn.Linear(2 * d, 2 * d), nn.GELU(),
                                      nn.Linear(2 * d, d), nn.Dropout(config.dropout))
@@ -71,37 +103,14 @@ class DynamicViGBlock(nn.Module):
                                  nn.Linear(config.mlp_ratio * d, d),
                                  nn.Dropout(config.dropout))
 
-    def _neighbors(self, features: Tensor, coordinates: Tensor) -> Tensor:
-        n = features.shape[0]
-        k = min(self.k, n - 1)
-        if k == 0:
-            return torch.empty((n, 0), dtype=torch.long, device=features.device)
-        # Float32 search is stable under AMP; chunks limit distance-matrix memory.
-        with torch.no_grad(), torch.autocast(device_type=features.device.type, enabled=False):
-            normalized = F.normalize(features.float(), dim=-1, eps=1e-6)
-            coordinates = coordinates.float()
-            neighbors = []
-            for start in range(0, n, self.chunk_size):
-                stop = min(start + self.chunk_size, n)
-                distances = torch.cdist(normalized[start:stop], normalized).square()
-                if self.spatial_weight:
-                    distances += self.spatial_weight * torch.cdist(
-                        coordinates[start:stop], coordinates).square()
-                local = torch.arange(stop - start, device=features.device)
-                distances[local, local + start] = float("inf")  # Exclude self.
-                neighbors.append(distances.topk(k, dim=1, largest=False).indices)
-            return torch.cat(neighbors, dim=0)
-
-    def forward(self, nodes: Tensor, valid: Tensor, coordinates: Tensor) -> Tensor:
+    def forward(self, nodes: Tensor, graphs: list[tuple[Tensor, Tensor]]) -> Tensor:
         projected = self.project(nodes)
         results = []
-        for b in range(nodes.shape[0]):
-            ids = valid[b].nonzero(as_tuple=False).flatten()
+        for b, (ids, neighbor_ids) in enumerate(graphs):
             if ids.numel() == 0:
                 results.append(torch.zeros_like(nodes[b]))
                 continue
             center = projected[b, ids]
-            neighbor_ids = self._neighbors(center, coordinates[ids])
             if neighbor_ids.shape[1]:
                 relative = (center[neighbor_ids] - center[:, None]).amax(dim=1)
             else:
@@ -129,6 +138,15 @@ class RapeseedTransformerViG(nn.Module):
         d, p = cfg.embed_dim, cfg.patch_size
         # An extra channel exposes which within-patch pixels were observed.
         self.patch_embedding = nn.Conv2d(cfg.in_channels + 1, d, p, stride=p)
+        self.spatial_embedding = nn.Sequential(nn.Linear(6, d), nn.GELU(), nn.Linear(d, d))
+        self.vit_encoder = nn.ModuleList([
+            nn.TransformerEncoderLayer(d_model=d, nhead=cfg.vit_heads,
+                                       dim_feedforward=cfg.mlp_ratio * d,
+                                       dropout=cfg.dropout, activation="gelu",
+                                       batch_first=True, norm_first=True)
+            for _ in range(cfg.vit_layers)
+        ])
+        self.vit_norm = nn.LayerNorm(d)
         self.time_embedding = nn.Sequential(nn.Linear(7, d), nn.GELU(), nn.Linear(d, d))
         # Construct each layer independently rather than cloning identical weights.
         self.temporal_encoder = nn.ModuleList([
@@ -139,8 +157,8 @@ class RapeseedTransformerViG(nn.Module):
             for _ in range(cfg.temporal_layers)
         ])
         self.temporal_norm = nn.LayerNorm(d)
-        self.spatial_embedding = nn.Sequential(nn.Linear(6, d), nn.GELU(), nn.Linear(d, d))
-        self.graph_blocks = nn.ModuleList([DynamicViGBlock(cfg) for _ in range(cfg.graph_layers)])
+        self.graph_construction = SpatialPatchGraph(cfg)
+        self.graph_blocks = nn.ModuleList([SpatialGraphBlock(cfg) for _ in range(cfg.graph_layers)])
         self.final_norm = nn.LayerNorm(d)
         self.field_head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(),
                                         nn.Dropout(cfg.dropout), nn.Linear(d, 1))
@@ -216,7 +234,30 @@ class RapeseedTransformerViG(nn.Module):
             missing = (~node_valid.any(dim=1)).nonzero(as_tuple=False).flatten().tolist()
             raise ValueError(f"No usable patches in batch samples {missing}; inspect masks or coverage threshold")
 
-        tokens = embedded.flatten(2).transpose(1, 2).reshape(b, t, n, d).permute(0, 2, 1, 3)
+        # Spatial ViT: attend over patches within each image, before graph creation.
+        # Pixel-based positions are invariant to other samples' batch padding.
+        yy, xx = torch.meshgrid(
+            (torch.arange(gh, device=images.device, dtype=torch.float32) + 0.5) * p / 128,
+            (torch.arange(gw, device=images.device, dtype=torch.float32) + 0.5) * p / 128,
+            indexing="ij",
+        )
+        xy = torch.stack((xx.flatten(), yy.flatten()), dim=-1)
+        spatial_features = torch.cat((xy, (2 * math.pi * xy).sin(), (2 * math.pi * xy).cos()), dim=-1)
+        tokens = embedded.flatten(2).transpose(1, 2)
+        tokens = tokens + self.spatial_embedding(spatial_features.to(images.dtype))[None]
+        image_valid = date_valid.transpose(1, 2).reshape(b * t, n)
+        active_images = image_valid.any(dim=1).nonzero(as_tuple=False).flatten()
+        # Entirely cloudy/padded dates never enter attention; invalid keys are masked.
+        spatial_sequence = torch.where(image_valid[..., None], tokens, 0)[active_images]
+        for layer in self.vit_encoder:
+            spatial_sequence = layer(spatial_sequence,
+                                     src_key_padding_mask=~image_valid[active_images])
+        spatial_sequence = torch.where(image_valid[active_images, :, None],
+                                       self.vit_norm(spatial_sequence), 0)
+        tokens = spatial_sequence.new_zeros((b * t, n, d)).index_copy(
+            0, active_images, spatial_sequence)
+        tokens = tokens.reshape(b, t, n, d).permute(0, 2, 1, 3)
+        # Fuse contextual features across dates for one graph node per patch.
         safe_days = torch.where(time_mask, days_since_sowing, 0).to(images.dtype)
         time_features = [safe_days / 365.25]
         for period in (365.25, 90.0, 30.0):
@@ -238,18 +279,10 @@ class RapeseedTransformerViG(nn.Module):
         pooled = sequence.sum(dim=1) / valid_dates.sum(dim=1, keepdim=True).to(sequence.dtype)
         nodes = pooled.new_zeros((b * n, d)).index_copy(0, active, pooled).reshape(b, n, d)
 
-        # Fixed pixel-based coordinates: unchanged when another sample adds padding.
-        yy, xx = torch.meshgrid(
-            (torch.arange(gh, device=images.device, dtype=torch.float32) + 0.5) * p / 128,
-            (torch.arange(gw, device=images.device, dtype=torch.float32) + 0.5) * p / 128,
-            indexing="ij",
-        )
-        xy = torch.stack((xx.flatten(), yy.flatten()), dim=-1)
-        spatial_features = torch.cat((xy, (2 * math.pi * xy).sin(), (2 * math.pi * xy).cos()), dim=-1)
-        nodes = nodes + self.spatial_embedding(spatial_features.to(images.dtype))[None]
-        nodes = torch.where(node_valid[..., None], nodes, 0)
+        # Construct spatial edges once; GNN layers propagate over this same graph.
+        graphs = self.graph_construction(node_valid, xy) if self.graph_blocks else []
         for graph in self.graph_blocks:
-            nodes = graph(nodes, node_valid, xy)
+            nodes = graph(nodes, graphs)
         nodes = torch.where(node_valid[..., None], self.final_norm(nodes), 0)
 
         # Area-weighted pooling handles partial edge/parcel patches.
